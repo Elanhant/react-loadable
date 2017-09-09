@@ -1,231 +1,118 @@
-const React = require('react');
-const isWebpackBundle = require('is-webpack-bundle');
-const webpackRequireWeak = require('webpack-require-weak');
-const {inspect} = require('import-inspector');
+'use strict';
 
-function capture(fn) {
-  let reported = [];
-  let stopInspecting = inspect(metadata => reported.push(metadata));
-  let promise = fn();
-  stopInspecting();
-  return {promise, reported};
-}
+const syntax = require('babel-plugin-syntax-dynamic-import')
 
-function load(loader) {
-  let {promise, reported} = capture(() => {
-    return loader();
-  });
-
-  if (reported.length > 1) {
-    throw new Error('react-loadable cannot handle more than one import() in each loader');
+module.exports = function({types: t, template}) {
+  function currentModuleFileName(path) {
+    return t.objectProperty(
+      t.identifier('currentModuleFileName'),
+      t.stringLiteral(path.hub.file.opts.filename)
+    );
   }
 
-  let state = {
-    loading: true,
-    loaded: null,
-    error: null
-  };
-
-  let metadata = reported[0] || {};
-
-  try {
-    if (isWebpackBundle) {
-      if (typeof metadata.webpackRequireWeakId === 'function') {
-        state.loaded = webpackRequireWeak(metadata.webpackRequireWeakId());
-        if (state.loaded) state.loading = false;
-      }
-    } else {
-      if (typeof metadata.serverSideRequirePath === 'string') {
-        state.loading = false;
-        state.loaded = module.require(metadata.serverSideRequirePath);
-      }
-    }
-  } catch (err) {
-    state.error = err;
+  function importedModulePath(path) {
+    return t.objectProperty(
+      t.identifier('importedModulePath'),
+      path.node.arguments[0]
+    );
   }
 
-  state.promise = promise.then(loaded => {
-    state.loading = false;
-    state.loaded = loaded;
-    return loaded;
-  }).catch(err => {
-    state.loading = false;
-    state.error = err;
-    throw err;
-  });
+  const webpackTemplate = template('() => require.resolveWeak(MODULE)');
 
-  return state;
-}
-
-function loadMap(obj) {
-  let state = {
-    loading: false,
-    loaded: {},
-    error: null
-  };
-
-  let promises = [];
-
-  try {
-    Object.keys(obj).forEach(key => {
-      let result = load(obj[key]);
-
-      if (!result.loading) {
-        state.loaded[key] = result.loaded;
-        state.error = result.error;
-      } else {
-        state.loading = true;
-      }
-
-      promises.push(result.promise);
-
-      result.promise.then(res => {
-        state.loaded[key] = res;
-      }).catch(err => {
-        state.error = err;
-      });
-    });
-  } catch (err) {
-    state.error = err;
+  function webpackRequireWeakId(path) {
+    return t.objectProperty(
+      t.identifier('webpackRequireWeakId'),
+      webpackTemplate({
+        MODULE: path.node.arguments[0]
+      }).expression
+    );
   }
 
-  state.promise = Promise.all(promises).then(res => {
-    state.loading = false;
-    return res;
-  }).catch(err => {
-    state.loading = false;
-    throw err;
-  });
+  const serverTemplate = template('PATH.join(__dirname, MODULE)');
+  const pathId = Symbol('pathId');
 
-  return state;
-}
-
-function resolve(obj) {
-  return obj && obj.__esModule ? obj.default : obj;
-}
-
-function render(loaded, props) {
-  return React.createElement(resolve(loaded), props);
-}
-
-function createLoadableComponent(loadFn, options) {
-  if (!options.loading) {
-    throw new Error('react-loadable requires a `loading` component')
-  }
-
-  let opts = Object.assign({
-    loader: null,
-    loading: null,
-    delay: 200,
-    timeout: null,
-    render: render
-  }, options);
-
-  let res = null;
-
-  return class LoadableComponent extends React.Component {
-    constructor(props) {
-      super(props);
-
-      if (!res) {
-        res = loadFn(opts.loader);
-      }
-
-      this.state = {
-        error: res.error,
-        pastDelay: false,
-        timedOut: false,
-        loading: res.loading,
-        loaded: res.loaded
-      };
+  function serverSideRequirePath(path) {
+    if (!path.hub.file[pathId]) {
+      path.hub.file[pathId] = path.hub.file.addImport('path', 'default', 'path');
     }
 
-    static preload() {
-      if (!res) {
-        res = loadFn(opts.loader);
-      }
-    }
+    return t.objectProperty(
+      t.identifier('serverSideRequirePath'),
+      serverTemplate({
+        PATH: path.hub.file[pathId],
+        MODULE: path.node.arguments[0]
+      }).expression
+    );
+  }
 
-    componentWillMount() {
-      this._mounted = true;
+  const timeStartTemplate = template('const START = Date.now()');
+  const timeStartId = Symbol('timeStartId');
 
-      if (res.resolved) {
-        return;
-      }
+  function addTimeStart(path) {
+    const program = path.hub.file.path;
+    path.hub.file[timeStartId] = program.scope.generateUidIdentifier('start');
+    program.unshiftContainer(
+      'body',
+      timeStartTemplate({
+        START: path.hub.file[timeStartId]
+      })
+    );
+  }
 
-      if (typeof opts.delay === 'number') {
-        this._delay = setTimeout(() => {
-          this.setState({ pastDelay: true });
-        }, opts.delay);
-      }
+  const timeToImportTemplate = template('START - Date.now()');
 
-      if (typeof opts.timeout === 'number') {
-        this._timeout = setTimeout(() => {
-          this.setState({ timedOut: true });
-        }, opts.timeout);
-      }
+  function timeToImport(path) {
+    if (!path.hub.file[timeStartId]) addTimeStart(path);
 
-      let update = () => {
-        if (!this._mounted) {
-          return;
+    return t.objectProperty(
+      t.identifier('timeToImport'),
+      timeToImportTemplate({
+        START: path.hub.file[timeStartId]
+      }).expression
+    );
+  }
+
+  const visited = Symbol('visited');
+  const reportId = Symbol('reportId');
+
+  return {
+    inherits: syntax,
+    name: 'import-inspector',
+
+    visitor: {
+      CallExpression(path) {
+        if (path.node.callee.type !== 'Import') return;
+        if (path.node[visited]) return;
+
+        path.node[visited] = true;
+
+        const opts = Object.assign({
+          currentModuleFileName: true,
+          importedModulePath: true,
+          serverSideRequirePath: false,
+          webpackRequireWeakId: false,
+          timeToImport: false
+        }, this.opts);
+
+        if (!path.hub.file[reportId]) {
+          path.hub.file[reportId] = path.hub.file.addImport('import-inspector', 'report');
         }
 
-        this.setState({
-          error: res.error,
-          loaded: res.loaded,
-          loading: res.loading
-        });
+        const props = [];
 
-        this._clearTimeouts();
-      };
+        if (opts.currentModuleFileName) props.push(currentModuleFileName(path));
+        if (opts.importedModulePath) props.push(importedModulePath(path));
+        if (opts.serverSideRequirePath) props.push(serverSideRequirePath(path));
+        if (opts.webpackRequireWeakId) props.push(webpackRequireWeakId(path));
+        if (opts.timeToImport) props.push(timeToImport(path));
 
-      res.promise.then(() => {
-        update();
-      }).catch(err => {
-        update();
-        throw err;
-      });
-    }
-
-    componentWillUnmount() {
-      this._mounted = false;
-      this._clearTimeouts();
-    }
-
-    _clearTimeouts() {
-      clearTimeout(this._delay);
-      clearTimeout(this._timeout);
-    }
-
-    render() {
-      if (this.state.loading || this.state.error) {
-        return React.createElement(opts.loading, {
-          isLoading: this.state.loading,
-          pastDelay: this.state.pastDelay,
-          timedOut: this.state.timedOut,
-          error: this.state.error
-        });
-      } else if (this.state.loaded) {
-        return opts.render(this.state.loaded, this.props);
-      } else {
-        return null;
+        path.replaceWith(
+          t.callExpression(path.hub.file[reportId], [
+            path.node,
+            t.objectExpression(props)
+          ])
+        );
       }
     }
   };
-}
-
-function Loadable(opts) {
-  return createLoadableComponent(load, opts);
-}
-
-function LoadableMap(opts) {
-  if (typeof opts.render !== 'function') {
-    throw new Error('LoadableMap requires a `render(loaded, props)` function');
-  }
-
-  return createLoadableComponent(loadMap, opts);
-}
-
-Loadable.Map = LoadableMap;
-
-module.exports = Loadable;
+};
